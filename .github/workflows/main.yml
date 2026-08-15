@@ -20,11 +20,11 @@ jobs:
             artifact: simple-http-server-i686
           - target: armv5
             cc: arm-linux-gnueabi-gcc
-            arch_flags: -march=armv5te
+            arch_flags: -march=armv5te -mfloat-abi=soft
             artifact: simple-http-server-armv5
           - target: armv7
-            cc: arm-linux-gnueabihf-gcc
-            arch_flags: -march=armv7-a
+            cc: arm-linux-gnueabi-gcc
+            arch_flags: -march=armv7-a -mfloat-abi=soft
             artifact: simple-http-server-armv7
           - target: armv8
             cc: aarch64-linux-gnu-gcc
@@ -37,7 +37,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             gcc-arm-linux-gnueabi \
-            gcc-arm-linux-gnueabihf \
             gcc-aarch64-linux-gnu \
             gcc-i686-linux-gnu
       - name: Compile ${{ matrix.target }}
