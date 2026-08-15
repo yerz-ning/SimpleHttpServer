@@ -1,0 +1,49 @@
+name: Build for multiple archs (static)
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            cc: gcc
+            arch_flags: ""
+            artifact: simple-http-server-x86_64
+          - target: i686
+            cc: i686-linux-gnu-gcc
+            arch_flags: ""
+            artifact: simple-http-server-i686
+          - target: armv5
+            cc: arm-linux-gnueabi-gcc
+            arch_flags: -march=armv5te
+            artifact: simple-http-server-armv5
+          - target: armv7
+            cc: arm-linux-gnueabihf-gcc
+            arch_flags: -march=armv7-a
+            artifact: simple-http-server-armv7
+          - target: armv8
+            cc: aarch64-linux-gnu-gcc
+            arch_flags: ""
+            artifact: simple-http-server-armv8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabi \
+            gcc-arm-linux-gnueabihf \
+            gcc-aarch64-linux-gnu \
+            gcc-i686-linux-gnu
+      - name: Compile ${{ matrix.target }}
+        run: ${{ matrix.cc }} -static ${{ matrix.arch_flags }} -o ${{ matrix.artifact }} simple-http-server.c
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
