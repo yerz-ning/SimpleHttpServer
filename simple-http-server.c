@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 
 #define BUFFER_SIZE 4096
 #define DEFAULT_PORT 80
@@ -29,15 +30,17 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
     ssize_t total = 0;
     while (total < (ssize_t)len) {
         ssize_t n = send(fd, (char*)buf + total, len - total, 0);
-        if (n <= 0) return -1;
+        if (n <= 0) {
+            return -1;  // 发送失败
+        }
         total += n;
     }
     return total;
 }
 
-// 发送响应头
-void send_response(int client, int code, const char *status, const char *type,
-                   long content_length, const char *extra) {
+// 发送响应头，失败返回 -1
+int send_response(int client, int code, const char *status, const char *type,
+                  long content_length, const char *extra) {
     char header[512];
     int len = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -47,7 +50,8 @@ void send_response(int client, int code, const char *status, const char *type,
         "%s"
         "\r\n",
         code, status, type, content_length, extra ? extra : "");
-    send_all(client, header, len);
+    if (send_all(client, header, len) < 0) return -1;
+    return 0;
 }
 
 // 获取 MIME 类型
@@ -63,7 +67,7 @@ const char* get_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
-// 流式发送文件（支持 Range）
+// 响应 Range 请求，发送文件的指定字节范围
 void send_file_range(int client, const char *path, long start, long end) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -87,7 +91,10 @@ void send_file_range(int client, const char *path, long start, long end) {
     long content_length = end - start + 1;
     char extra[128];
     snprintf(extra, sizeof(extra), "Content-Range: bytes %ld-%ld/%ld\r\n", start, end, file_size);
-    send_response(client, 206, "Partial Content", get_mime_type(path), content_length, extra);
+    if (send_response(client, 206, "Partial Content", get_mime_type(path), content_length, extra) < 0) {
+        close(fd);
+        return;
+    }
     lseek(fd, start, SEEK_SET);
     char buf[BUFFER_SIZE];
     long remaining = content_length;
@@ -101,7 +108,7 @@ void send_file_range(int client, const char *path, long start, long end) {
     close(fd);
 }
 
-// 流式发送完整文件
+// 以流式方式发送完整的文件内容
 void send_file_complete(int client, const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -114,7 +121,10 @@ void send_file_complete(int client, const char *path) {
         send_response(client, 500, "Internal Error", "text/html", 0, NULL);
         return;
     }
-    send_response(client, 200, "OK", get_mime_type(path), st.st_size, NULL);
+    if (send_response(client, 200, "OK", get_mime_type(path), st.st_size, NULL) < 0) {
+        close(fd);
+        return;
+    }
     char buf[BUFFER_SIZE];
     ssize_t n;
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
@@ -155,7 +165,7 @@ void list_directory(int client, const char *path) {
     closedir(d);
 }
 
-// 处理请求（第一版风格）
+// 处理请求
 void handle_request(int client) {
     char buf[BUFFER_SIZE];
     int n = recv(client, buf, sizeof(buf)-1, 0);
@@ -166,7 +176,6 @@ void handle_request(int client) {
     char *path = strtok(NULL, " ");
     if (!method || !path) return;
 
-    // 查找 Range 头
     long start = 0, end = -1;
     int has_range = 0;
     char *range_header = strstr(buf, "Range: bytes=");
@@ -194,6 +203,12 @@ void handle_request(int client) {
         return;
     }
 
+    // 文件不存在或不可读
+    if (stat(fullpath, &st) != 0) {
+        send_response(client, 404, "Not Found", "text/html", 0, NULL);
+        return;
+    }
+
     if (has_range) {
         send_file_range(client, fullpath, start, end);
     } else {
@@ -202,6 +217,9 @@ void handle_request(int client) {
 }
 
 int main(int argc, char *argv[]) {
+    // 忽略 SIGPIPE，防止客户端断开时进程崩溃
+    signal(SIGPIPE, SIG_IGN);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
             port = atoi(argv[++i]);
