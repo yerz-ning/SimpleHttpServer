@@ -34,15 +34,13 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
         ssize_t n = send(fd, (char*)buf + total, len - total, 0);
         if (n <= 0) {
             if (log_level == 0) {
-                printf("发送失败，已发送 %ld 字节\n", total);
-                printf("Send failed, sent %ld bytes\n", total);
+                printf("发送失败，已发送 %ld 字节\nSend failed, sent %ld bytes\n", total);
             }
             return -1;
         }
         total += n;
         if (log_level == 0 && n > 0) {
-            printf("发送 %ld 字节，累计 %ld 字节\n", n, total);
-            printf("Sent %ld bytes, total %ld bytes\n", n, total);
+            printf("发送 %ld 字节，累计 %ld 字节\nSent %ld bytes, total %ld bytes\n", n, total);
         }
     }
     return total;
@@ -52,8 +50,8 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
 int send_header(int client, int code, const char *status, const char *type,
                 long content_length, const char *extra) {
     if (log_level == 0) {
-        printf("准备发送响应头：状态码 %d，内容类型 %s，长度 %ld\n", code, type, content_length);
-        printf("Preparing response header: status %d, type %s, length %ld\n", code, type, content_length);
+        printf("准备发送响应头：状态码 %d，内容类型 %s，长度 %ld\nPreparing response header: status %d, type %s, length %ld\n",
+               code, type, content_length);
     }
     char header[512];
     int len = snprintf(header, sizeof(header),
@@ -67,8 +65,7 @@ int send_header(int client, int code, const char *status, const char *type,
     if (send_all(client, header, len) < 0)
         return -1;
     if (log_level == 0) {
-        printf("响应头发送完成\n");
-        printf("Response header sent\n");
+        printf("响应头发送完成\nResponse header sent\n");
     }
     return 0;
 }
@@ -89,29 +86,25 @@ const char* get_mime_type(const char *path) {
 // 响应 Range 请求，发送文件的指定字节范围
 void send_file_range(int client, const char *path, long start, long end) {
     if (log_level == 0) {
-        printf("打开文件 %s (Range: %ld-%ld)\n", path, start, end);
-        printf("Opening file %s (Range: %ld-%ld)\n", path, start, end);
+        printf("打开文件 %s (Range: %ld-%ld)\nOpening file %s (Range: %ld-%ld)\n", path, start, end);
     }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         if (log_level == 0) {
-            printf("打开文件失败 %s\n", path);
-            printf("Failed to open file %s\n", path);
+            printf("打开文件失败 %s\nFailed to open file %s\n", path);
         }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
     if (log_level == 0) {
-        printf("文件打开成功 %s\n", path);
-        printf("File opened successfully %s\n", path);
+        printf("文件打开成功 %s\nFile opened successfully %s\n", path);
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
         if (log_level == 0) {
-            printf("获取文件状态失败 %s\n", path);
-            printf("Failed to get file stats %s\n", path);
+            printf("获取文件状态失败 %s\nFailed to get file stats %s\n", path);
         }
         send_header(client, 500, "Internal Error", "text/html", 0, NULL);
         return;
@@ -122,8 +115,7 @@ void send_file_range(int client, const char *path, long start, long end) {
     if (start > end || start >= file_size) {
         close(fd);
         if (log_level == 0) {
-            printf("Range 请求无效: %ld-%ld，文件大小 %ld\n", start, end, file_size);
-            printf("Invalid Range: %ld-%ld, file size %ld\n", start, end, file_size);
+            printf("Range 请求无效: %ld-%ld，文件大小 %ld\nInvalid Range: %ld-%ld, file size %ld\n", start, end, file_size);
         }
         send_header(client, 416, "Range Not Satisfiable", "text/html", 0, NULL);
         return;
@@ -148,45 +140,41 @@ void send_file_range(int client, const char *path, long start, long end) {
         if (n <= 0) break;
         chunk_count++;
         if (log_level == 0) {
-            printf("发送文件块 %d，大小 %ld 字节，剩余 %ld 字节\n", chunk_count, n, remaining - n);
-            printf("Sending file chunk %d, size %ld bytes, remaining %ld bytes\n", chunk_count, n, remaining - n);
+            printf("发送文件块 %d，大小 %ld 字节，剩余 %ld 字节\nSending file chunk %d, size %ld bytes, remaining %ld bytes\n",
+                   chunk_count, n, remaining - n);
         }
         if (send_all(client, buf, n) < 0) break;
         remaining -= n;
     }
     close(fd);
     if (log_level == 0) {
-        printf("文件发送完成 %s，共 %d 个块，实际发送 %ld 字节\n", path, chunk_count, content_length - remaining);
-        printf("File send complete %s, %d chunks, sent %ld bytes\n", path, chunk_count, content_length - remaining);
+        printf("文件发送完成 %s，共 %d 个块，实际发送 %ld 字节\nFile send complete %s, %d chunks, sent %ld bytes\n",
+               path, chunk_count, content_length - remaining);
     }
 }
 
 // 以流式方式发送完整的文件内容
 void send_file_complete(int client, const char *path) {
     if (log_level == 0) {
-        printf("打开文件 %s\n", path);
-        printf("Opening file %s\n", path);
+        printf("打开文件 %s\nOpening file %s\n", path);
     }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         if (log_level == 0) {
-            printf("打开文件失败 %s\n", path);
-            printf("Failed to open file %s\n", path);
+            printf("打开文件失败 %s\nFailed to open file %s\n", path);
         }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
     if (log_level == 0) {
-        printf("文件打开成功 %s\n", path);
-        printf("File opened successfully %s\n", path);
+        printf("文件打开成功 %s\nFile opened successfully %s\n", path);
     }
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
         if (log_level == 0) {
-            printf("获取文件状态失败 %s\n", path);
-            printf("Failed to get file stats %s\n", path);
+            printf("获取文件状态失败 %s\nFailed to get file stats %s\n", path);
         }
         send_header(client, 500, "Internal Error", "text/html", 0, NULL);
         return;
@@ -204,37 +192,35 @@ void send_file_complete(int client, const char *path) {
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         chunk_count++;
         if (log_level == 0) {
-            printf("发送文件块 %d，大小 %ld 字节，累计 %ld 字节\n", chunk_count, n, total_sent + n);
-            printf("Sending file chunk %d, size %ld bytes, total %ld bytes\n", chunk_count, n, total_sent + n);
+            printf("发送文件块 %d，大小 %ld 字节，累计 %ld 字节\nSending file chunk %d, size %ld bytes, total %ld bytes\n",
+                   chunk_count, n, total_sent + n);
         }
         if (send_all(client, buf, n) < 0) break;
         total_sent += n;
     }
     close(fd);
     if (log_level == 0) {
-        printf("文件发送完成 %s，共 %d 个块，总大小 %ld 字节\n", path, chunk_count, total_sent);
-        printf("File send complete %s, %d chunks, total %ld bytes\n", path, chunk_count, total_sent);
+        printf("文件发送完成 %s，共 %d 个块，总大小 %ld 字节\nFile send complete %s, %d chunks, total %ld bytes\n",
+               path, chunk_count, total_sent);
     }
 }
 
 // 流式生成指定目录的 HTML 文件列表
 void list_directory(int client, const char *path) {
     if (log_level == 0) {
-        printf("打开目录 %s\n", path);
-        printf("Opening directory %s\n", path);
+        printf("进入 list_directory，路径 %s\nEntering list_directory, path %s\n", path);
+        printf("打开目录 %s\nOpening directory %s\n", path);
     }
     DIR *d = opendir(path);
     if (!d) {
         if (log_level == 0) {
-            printf("打开目录失败 %s\n", path);
-            printf("Failed to open directory %s\n", path);
+            printf("打开目录失败 %s\nFailed to open directory %s\n", path);
         }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
     if (log_level == 0) {
-        printf("目录打开成功 %s\n", path);
-        printf("Directory opened successfully %s\n", path);
+        printf("目录打开成功 %s\nDirectory opened successfully %s\n", path);
     }
 
     const char *head = "<!DOCTYPE html><html><head><meta charset=utf-8><title>File list</title></head><body><h2>Index of ";
@@ -268,8 +254,8 @@ void list_directory(int client, const char *path) {
             snprintf(line, sizeof(line), "<li><a href=\"%s\">%s</a></li>", entry->d_name, entry->d_name);
         }
         if (log_level == 0) {
-            printf("目录条目 %d: %s (%s)\n", entry_count, entry->d_name, S_ISDIR(st.st_mode) ? "目录" : "文件");
-            printf("Directory entry %d: %s (%s)\n", entry_count, entry->d_name, S_ISDIR(st.st_mode) ? "dir" : "file");
+            printf("目录条目 %d: %s (%s)\nDirectory entry %d: %s (%s)\n",
+                   entry_count, entry->d_name, S_ISDIR(st.st_mode) ? "目录" : "文件");
         }
         if (send_all(client, line, strlen(line)) < 0) {
             closedir(d);
@@ -280,8 +266,7 @@ void list_directory(int client, const char *path) {
     send_all(client, tail, strlen(tail));
     closedir(d);
     if (log_level == 0) {
-        printf("目录列表发送完成 %s，共 %d 个条目\n", path, entry_count);
-        printf("Directory list sent %s, %d entries\n", path, entry_count);
+        printf("目录列表发送完成 %s，共 %d 个条目\nDirectory list sent %s, %d entries\n", path, entry_count);
     }
 }
 
@@ -307,8 +292,7 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
     int n = recv(client, buf, sizeof(buf)-1, 0);
     if (n <= 0) {
         if (log_level == 0) {
-            printf("连接关闭或读取失败\n");
-            printf("Connection closed or read failed\n");
+            printf("连接关闭或读取失败\nConnection closed or read failed\n");
         }
         return;
     }
@@ -318,31 +302,34 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
     char *path = strtok(NULL, " ");
     if (!method || !path) {
         if (log_level == 0) {
-            printf("无效请求\n");
-            printf("Invalid request\n");
+            printf("无效请求\nInvalid request\n");
         }
         return;
     }
 
     if (log_level == 0) {
-        printf("收到请求：方法 %s，路径 %s\n", method, path);
-        printf("Received request: method %s, path %s\n", method, path);
+        printf("收到请求：方法 %s，路径 %s\nReceived request: method %s, path %s\n", method, path);
     }
 
-    char headers[2048] = {0};
-    int total = 0;
-    while (1) {
-        n = recv(client, buf, sizeof(buf)-1, 0);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        total += n;
-        if (total >= (int)sizeof(headers)-1) break;
-        strcat(headers, buf);
-        if (strstr(headers, "\r\n\r\n") || strstr(headers, "\n\n")) break;
-    }
-    if (log_level == 0) {
-        printf("请求头读取完成，共 %d 字节\n", total);
-        printf("Headers read complete, %d bytes\n", total);
+    // 直接从已读取的 buf 中查找 Range 头，不额外循环读取
+    long start = 0, end = -1;
+    int has_range = 0;
+    char *range_header = strstr(buf, "Range: bytes=");
+    if (range_header) {
+        range_header += 13;
+        char *dash = strchr(range_header, '-');
+        if (dash) {
+            start = atol(range_header);
+            if (*(dash+1) != '\0') {
+                end = atol(dash+1);
+            } else {
+                end = -1;
+            }
+            has_range = 1;
+            if (log_level == 0) {
+                printf("Range 请求: %ld-%ld\nRange request: %ld-%ld\n", start, end);
+            }
+        }
     }
 
     char fullpath[1024];
@@ -353,37 +340,28 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
     }
 
     if (log_level == 0) {
-        printf("完整路径: %s\n", fullpath);
-        printf("Full path: %s\n", fullpath);
+        printf("完整路径: %s\nFull path: %s\n", fullpath);
     }
 
     struct stat st;
     if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
         if (log_level == 0) {
-            printf("路径是目录，开始生成列表\n");
-            printf("Path is directory, generating list\n");
+            printf("路径是目录，开始生成列表\nPath is directory, generating list\n");
         }
         list_directory(client, fullpath);
         if (log_level == 0) {
-            printf("目录请求处理完成\n");
-            printf("Directory request complete\n");
+            printf("目录请求处理完成\nDirectory request complete\n");
         }
         return;
     }
 
-    long start = 0, end = -1;
-    if (parse_range(headers, &start, &end)) {
-        if (log_level == 0) {
-            printf("Range 请求: %ld-%ld\n", start, end);
-            printf("Range request: %ld-%ld\n", start, end);
-        }
+    if (has_range) {
         send_file_range(client, fullpath, start, end);
     } else {
         send_file_complete(client, fullpath);
     }
     if (log_level == 0) {
-        printf("文件请求处理完成\n");
-        printf("File request complete\n");
+        printf("文件请求处理完成\nFile request complete\n");
     }
 }
 
@@ -427,14 +405,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    printf("HTTP 服务器已启动，端口 %d，根目录 %s\n", port, root_dir);
-    printf("HTTP server started on port %d, serving %s\n", port, root_dir);
+    printf("HTTP 服务器已启动，端口 %d，根目录 %s\nHTTP server started on port %d, serving %s\n", port, root_dir, port, root_dir);
     if (log_level == 0) {
-        printf("日志级别：详细\n");
-        printf("Log level: info\n");
+        printf("日志级别：详细\nLog level: info\n");
     } else {
-        printf("日志级别：错误\n");
-        printf("Log level: error\n");
+        printf("日志级别：错误\nLog level: error\n");
     }
 
     fd_set readfds;
@@ -466,14 +441,14 @@ int main(int argc, char *argv[]) {
         }
 
         if (log_level == 0) {
-            printf("新连接来自 %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-            printf("New connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            printf("新连接来自 %s:%d\nNew connection from %s:%d\n",
+                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         }
         handle_request(client, &client_addr);
         close(client);
         if (log_level == 0) {
-            printf("连接关闭 %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-            printf("Connection closed %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+            printf("连接关闭 %s:%d\nConnection closed %s:%d\n",
+                   inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         }
     }
     close(sock);
