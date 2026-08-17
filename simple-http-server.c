@@ -25,9 +25,9 @@
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
-int log_level = 1;
+int log_level = 1; // 默认错误级别
 
-// 将缓冲区数据全部发送到套接字描述符，失败返回 -1
+// 安全发送所有数据
 ssize_t send_all(int fd, const void *buf, size_t len) {
     ssize_t total = 0;
     while (total < (ssize_t)len) {
@@ -46,7 +46,7 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
     return total;
 }
 
-// 向客户端发送 HTTP 响应头，失败返回 -1
+// 发送响应头
 int send_header(int client, int code, const char *status, const char *type,
                 long content_length, const char *extra) {
     if (log_level == 0) {
@@ -70,7 +70,7 @@ int send_header(int client, int code, const char *status, const char *type,
     return 0;
 }
 
-// 根据文件扩展名返回对应的 MIME 类型
+// 获取 MIME 类型
 const char* get_mime_type(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return "application/octet-stream";
@@ -83,7 +83,7 @@ const char* get_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
-// 响应 Range 请求，发送文件的指定字节范围
+// 发送文件 Range
 void send_file_range(int client, const char *path, long start, long end) {
     if (log_level == 0) {
         printf("打开文件 %s (Range: %ld-%ld)\nOpening file %s (Range: %ld-%ld)\n", path, start, end);
@@ -95,9 +95,6 @@ void send_file_range(int client, const char *path, long start, long end) {
         }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
-    }
-    if (log_level == 0) {
-        printf("文件打开成功 %s\nFile opened successfully %s\n", path);
     }
 
     struct stat st;
@@ -153,7 +150,7 @@ void send_file_range(int client, const char *path, long start, long end) {
     }
 }
 
-// 以流式方式发送完整的文件内容
+// 发送完整文件
 void send_file_complete(int client, const char *path) {
     if (log_level == 0) {
         printf("打开文件 %s\nOpening file %s\n", path);
@@ -165,9 +162,6 @@ void send_file_complete(int client, const char *path) {
         }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
-    }
-    if (log_level == 0) {
-        printf("文件打开成功 %s\nFile opened successfully %s\n", path);
     }
 
     struct stat st;
@@ -205,11 +199,10 @@ void send_file_complete(int client, const char *path) {
     }
 }
 
-// 流式生成指定目录的 HTML 文件列表
+// 生成目录列表
 void list_directory(int client, const char *path) {
     if (log_level == 0) {
         printf("进入 list_directory，路径 %s\nEntering list_directory, path %s\n", path);
-        printf("打开目录 %s\nOpening directory %s\n", path);
     }
     DIR *d = opendir(path);
     if (!d) {
@@ -270,23 +263,7 @@ void list_directory(int client, const char *path) {
     }
 }
 
-// 从请求头中解析 Range 字段
-long parse_range(const char *headers, long *start, long *end) {
-    const char *range_header = strstr(headers, "Range: bytes=");
-    if (!range_header) return 0;
-    range_header += 13;
-    char *dash = strchr(range_header, '-');
-    if (!dash) return 0;
-    *start = atol(range_header);
-    if (*(dash+1) != '\0') {
-        *end = atol(dash+1);
-    } else {
-        *end = -1;
-    }
-    return 1;
-}
-
-// 处理单个 HTTP 请求
+// 处理请求
 void handle_request(int client, struct sockaddr_in *client_addr) {
     char buf[BUFFER_SIZE];
     int n = recv(client, buf, sizeof(buf)-1, 0);
@@ -296,13 +273,13 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
         }
         return;
     }
-    buf[n] = '\0';
+    buf[n] = '\0'; // 确保以 null 结尾
 
-    char *method = strtok(buf, " ");
-    char *path = strtok(NULL, " ");
-    if (!method || !path) {
+    // 安全解析请求行：使用 sscanf 避免 strtok 的副作用
+    char method[16], path[1024];
+    if (sscanf(buf, "%15s %1023s", method, path) != 2) {
         if (log_level == 0) {
-            printf("无效请求\nInvalid request\n");
+            printf("无效请求行\nInvalid request line\n");
         }
         return;
     }
@@ -311,7 +288,7 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
         printf("收到请求：方法 %s，路径 %s\nReceived request: method %s, path %s\n", method, path);
     }
 
-    // 直接从已读取的 buf 中查找 Range 头，不额外循环读取
+    // 查找 Range 头（仅从第一块数据中查找）
     long start = 0, end = -1;
     int has_range = 0;
     char *range_header = strstr(buf, "Range: bytes=");
@@ -332,6 +309,7 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
         }
     }
 
+    // 构建完整路径
     char fullpath[1024];
     if (strcmp(path, "/") == 0) {
         snprintf(fullpath, sizeof(fullpath), "%s", root_dir);
@@ -365,7 +343,6 @@ void handle_request(int client, struct sockaddr_in *client_addr) {
     }
 }
 
-// 程序入口
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
