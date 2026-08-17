@@ -25,6 +25,7 @@
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
+int log_level = 0; // 0 = info, 1 = error
 
 // 将缓冲区数据全部发送到套接字描述符
 ssize_t send_all(int fd, const void *buf, size_t len) {
@@ -182,15 +183,27 @@ long parse_range(const char *headers, long *start, long *end) {
 }
 
 // 处理单个 HTTP 请求，根据路径类型分发到不同处理函数
-void handle_request(int client) {
+void handle_request(int client, struct sockaddr_in *client_addr) {
     char buf[BUFFER_SIZE];
     int n = recv(client, buf, sizeof(buf)-1, 0);
-    if (n <= 0) return;
+    if (n <= 0) {
+        if (log_level == 0) {
+            printf("连接关闭或读取失败\n");
+            printf("Connection closed or read failed\n");
+        }
+        return;
+    }
     buf[n] = '\0';
 
     char *method = strtok(buf, " ");
     char *path = strtok(NULL, " ");
-    if (!method || !path) return;
+    if (!method || !path) {
+        if (log_level == 0) {
+            printf("无效请求\n");
+            printf("Invalid request\n");
+        }
+        return;
+    }
 
     char headers[2048] = {0};
     int total = 0;
@@ -213,14 +226,26 @@ void handle_request(int client) {
 
     struct stat st;
     if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (log_level == 0) {
+            printf("来自 %s 请求目录 %s\n", inet_ntoa(client_addr->sin_addr), path);
+            printf("Request from %s for directory %s\n", inet_ntoa(client_addr->sin_addr), path);
+        }
         list_directory(client, fullpath);
         return;
     }
 
     long start = 0, end = -1;
     if (parse_range(headers, &start, &end)) {
+        if (log_level == 0) {
+            printf("来自 %s 请求文件 %s (Range: %ld-%ld)\n", inet_ntoa(client_addr->sin_addr), path, start, end);
+            printf("Request from %s for file %s (Range: %ld-%ld)\n", inet_ntoa(client_addr->sin_addr), path, start, end);
+        }
         send_file_range(client, fullpath, start, end);
     } else {
+        if (log_level == 0) {
+            printf("来自 %s 请求文件 %s\n", inet_ntoa(client_addr->sin_addr), path);
+            printf("Request from %s for file %s\n", inet_ntoa(client_addr->sin_addr), path);
+        }
         send_file_complete(client, fullpath);
     }
 }
@@ -232,6 +257,10 @@ int main(int argc, char *argv[]) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 && i+1 < argc) {
             root_dir = argv[++i];
+        } else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) {
+            if (strcmp(argv[++i], "error") == 0) {
+                log_level = 1;
+            }
         } else {
             return 1;
         }
@@ -268,13 +297,18 @@ int main(int argc, char *argv[]) {
         if (ret == 0) {
             continue;
         }
-        int client = accept(sock, NULL, NULL);
+
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client = accept(sock, (struct sockaddr *)&client_addr, &addr_len);
         if (client < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
-        handle_request(client);
+
+        // 处理请求，传入客户端地址用于日志
+        handle_request(client, &client_addr);
         close(client);
     }
     close(sock);
