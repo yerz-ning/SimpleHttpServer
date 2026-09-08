@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <ctype.h>
 
 #define BUFFER_SIZE 4096
 #define DEFAULT_PORT 80
@@ -54,6 +55,16 @@ int send_header(int client, int code, const char *status, const char *type,
         "%s"
         "\r\n",
         code, status, type, content_length, extra ? extra : "");
+    if (len < 0 || len >= (int)sizeof(header)) {
+        // 头部过长时，发送基本头
+        len = snprintf(header, sizeof(header),
+            "HTTP/1.1 %d %s\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %ld\r\n"
+            "Connection: close\r\n"
+            "\r\n",
+            code, status, type, content_length);
+    }
     return send_all(client, header, len);
 }
 
@@ -67,21 +78,54 @@ const char* get_mime_type(const char *path) {
     if (strcmp(ext, ".png") == 0) return "image/png";
     if (strcmp(ext, ".css") == 0) return "text/css";
     if (strcmp(ext, ".js") == 0) return "application/javascript";
+    if (strcmp(ext, ".txt") == 0) return "text/plain";
+    if (strcmp(ext, ".mp3") == 0) return "audio/mpeg";
+    if (strcmp(ext, ".pdf") == 0) return "application/pdf";
     return "application/octet-stream";
+}
+
+// 安全构建路径，防止目录遍历
+int build_safe_path(const char *root, const char *url_path, char *out, size_t out_size) {
+    char abs_root[1024];
+    if (realpath(root, abs_root) == NULL) {
+        if (mkdir(root, 0755) != 0 && errno != EEXIST) return -1;
+        if (realpath(root, abs_root) == NULL) return -1;
+    }
+
+    char combined[2048];
+    int len = snprintf(combined, sizeof(combined), "%s%s", abs_root, url_path);
+    if (len < 0 || len >= (int)sizeof(combined)) return -1;
+
+    char resolved[2048];
+    if (realpath(combined, resolved) == NULL) {
+        // 文件/目录不存在，尝试规范化父目录
+        char copy[2048];
+        strncpy(copy, combined, sizeof(copy)-1);
+        copy[sizeof(copy)-1] = '\0';
+        char *last_slash = strrchr(copy, '/');
+        if (last_slash == NULL) return -1;
+        *last_slash = '\0';
+        char parent[2048];
+        if (realpath(copy, parent) == NULL) return -1;
+        size_t root_len = strlen(abs_root);
+        if (strncmp(parent, abs_root, root_len) != 0 ||
+            (parent[root_len] != '\0' && parent[root_len] != '/')) return -1;
+        snprintf(out, out_size, "%s/%s", parent, last_slash + 1);
+        return 0;
+    }
+
+    size_t root_len = strlen(abs_root);
+    if (strncmp(resolved, abs_root, root_len) != 0 ||
+        (resolved[root_len] != '\0' && resolved[root_len] != '/')) return -1;
+
+    snprintf(out, out_size, "%s", resolved);
+    return 0;
 }
 
 // 发送文件完整内容（流式）
 void send_file_complete(int client, const char *path) {
-    if (log_level == 0) {
-        printf("打开文件 %s\n", path);
-        printf("Opening file %s\n", path);
-    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        if (log_level == 0) {
-            printf("文件不存在 %s\n", path);
-            printf("File not found %s\n", path);
-        }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
@@ -101,24 +145,12 @@ void send_file_complete(int client, const char *path) {
         if (send_all(client, buf, n) < 0) break;
     }
     close(fd);
-    if (log_level == 0) {
-        printf("文件发送完成 %s\n", path);
-        printf("File sent %s\n", path);
-    }
 }
 
 // 发送文件部分内容（Range 请求）
 void send_file_range(int client, const char *path, long start, long end) {
-    if (log_level == 0) {
-        printf("打开文件 %s Range: %ld-%ld\n", path, start, end);
-        printf("Opening file %s Range: %ld-%ld\n", path, start, end);
-    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        if (log_level == 0) {
-            printf("文件不存在 %s\n", path);
-            printf("File not found %s\n", path);
-        }
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
@@ -130,7 +162,7 @@ void send_file_range(int client, const char *path, long start, long end) {
     }
     long file_size = st.st_size;
     if (end == -1) end = file_size - 1;
-    if (start > end || start >= file_size) {
+    if (start < 0 || end < 0 || start >= file_size || start > end) {
         close(fd);
         send_header(client, 416, "Range Not Satisfiable", "text/html", 0, NULL);
         return;
@@ -144,42 +176,52 @@ void send_file_range(int client, const char *path, long start, long end) {
         close(fd);
         return;
     }
-    lseek(fd, start, SEEK_SET);
+    if (lseek(fd, start, SEEK_SET) < 0) {
+        close(fd);
+        return;
+    }
     char buf[BUFFER_SIZE];
     long remaining = content_length;
     while (remaining > 0) {
-        long to_read = (remaining < BUFFER_SIZE) ? remaining : BUFFER_SIZE;
+        long to_read = (remaining < (long)sizeof(buf)) ? remaining : (long)sizeof(buf);
         ssize_t n = read(fd, buf, to_read);
         if (n <= 0) break;
         if (send_all(client, buf, n) < 0) break;
         remaining -= n;
     }
     close(fd);
-    if (log_level == 0) {
-        printf("Range 发送完成 %s\n", path);
-        printf("Range sent %s\n", path);
-    }
 }
 
 // 流式目录列表
 void list_directory(int client, const char *path) {
-    if (log_level == 0) {
-        printf("列出目录 %s\n", path);
-        printf("Listing directory %s\n", path);
-    }
     DIR *d = opendir(path);
     if (!d) {
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
+
+    // 先发送头部，使用 Transfer-Encoding: chunked 或直接关闭连接
+    char header[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+    if (send_all(client, header, strlen(header)) < 0) {
+        closedir(d);
+        return;
+    }
+
     char *head = "<!DOCTYPE html><html><head><title>Index</title></head><body><h2>Index of ";
     send_all(client, head, strlen(head));
-    send_all(client, path, strlen(path));
+    // 显示相对路径
+    char display_path[1024];
+    if (strcmp(path, root_dir) == 0) {
+        snprintf(display_path, sizeof(display_path), "/");
+    } else {
+        snprintf(display_path, sizeof(display_path), "%s/", path + strlen(root_dir));
+    }
+    send_all(client, display_path, strlen(display_path));
     char *mid = "</h2><ul>";
     send_all(client, mid, strlen(mid));
 
     struct dirent *entry;
-    char fullpath[512];
+    char fullpath[2048];
     while ((entry = readdir(d))) {
         if (entry->d_name[0] == '.') continue;
         snprintf(fullpath, sizeof(fullpath), "%s/%s", path, entry->d_name);
@@ -198,6 +240,24 @@ void list_directory(int client, const char *path) {
     closedir(d);
 }
 
+// URL 解码
+void url_decode(char *str) {
+    char *p = str, *q = str;
+    while (*p) {
+        if (*p == '%' && isxdigit(*(p+1)) && isxdigit(*(p+2))) {
+            int high = tolower(*(p+1));
+            int low = tolower(*(p+2));
+            int value = (high <= '9' ? high - '0' : high - 'a' + 10) * 16 +
+                        (low <= '9' ? low - '0' : low - 'a' + 10);
+            *q++ = (char)value;
+            p += 3;
+        } else {
+            *q++ = *p++;
+        }
+    }
+    *q = '\0';
+}
+
 // 解析 Range 头
 long parse_range(const char *headers, long *start, long *end) {
     const char *p = strstr(headers, "Range: bytes=");
@@ -211,17 +271,45 @@ long parse_range(const char *headers, long *start, long *end) {
     } else {
         *end = -1;
     }
+    if (*start < 0 || (*end != -1 && *end < 0)) return 0;
     return 1;
+}
+
+// 读取完整 HTTP 头部，直到空行
+int read_http_headers(int client, char *buffer, size_t buf_size, int *total_read) {
+    size_t total = 0;
+    while (total < buf_size - 1) {
+        ssize_t n = recv(client, buffer + total, buf_size - 1 - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+        buffer[total] = '\0';
+        if (strstr(buffer, "\r\n\r\n") != NULL || strstr(buffer, "\n\n") != NULL) {
+            *total_read = total;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 // 处理请求
 void handle_request(int client, struct sockaddr_in *addr) {
-    char buf[BUFFER_SIZE];
-    int n = recv(client, buf, sizeof(buf)-1, 0);
-    if (n <= 0) return;
-    buf[n] = '\0';
+    char headers[4096];
+    int total = 0;
+    if (read_http_headers(client, headers, sizeof(headers), &total) < 0) {
+        return;
+    }
 
-    char *method = strtok(buf, " ");
+    // 解析请求行
+    char *line_end = strstr(headers, "\r\n");
+    if (line_end == NULL) line_end = strstr(headers, "\n");
+    if (line_end == NULL) return;
+    char request_line[2048];
+    size_t line_len = line_end - headers;
+    if (line_len >= sizeof(request_line)) return;
+    memcpy(request_line, headers, line_len);
+    request_line[line_len] = '\0';
+
+    char *method = strtok(request_line, " ");
     char *path = strtok(NULL, " ");
     if (!method || !path) return;
 
@@ -230,24 +318,14 @@ void handle_request(int client, struct sockaddr_in *addr) {
         printf("Request %s %s (from %s)\n", method, path, inet_ntoa(addr->sin_addr));
     }
 
-    // 读取剩余请求头
-    char headers[2048] = {0};
-    int total = 0;
-    while (1) {
-        n = recv(client, buf, sizeof(buf)-1, 0);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        total += n;
-        if (total >= (int)sizeof(headers)-1) break;
-        strcat(headers, buf);
-        if (strstr(headers, "\r\n\r\n") || strstr(headers, "\n\n")) break;
-    }
+    // URL 解码
+    url_decode(path);
 
-    char fullpath[1024];
-    if (strcmp(path, "/") == 0) {
-        snprintf(fullpath, sizeof(fullpath), "%s", root_dir);
-    } else {
-        snprintf(fullpath, sizeof(fullpath), "%s%s", root_dir, path);
+    // 安全构建文件系统路径
+    char fullpath[2048];
+    if (build_safe_path(root_dir, path, fullpath, sizeof(fullpath)) < 0) {
+        send_header(client, 403, "Forbidden", "text/html", 0, NULL);
+        return;
     }
 
     struct stat st;
@@ -266,6 +344,9 @@ void handle_request(int client, struct sockaddr_in *addr) {
 
 // 程序入口
 int main(int argc, char *argv[]) {
+    // 忽略 SIGPIPE，防止客户端断开导致进程退出
+    signal(SIGPIPE, SIG_IGN);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
             port = atoi(argv[++i]);
@@ -274,6 +355,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) {
             if (strcmp(argv[++i], "info") == 0) log_level = 0;
         } else {
+            fprintf(stderr, "用法: %s [-p port] [-r root_dir] [-l info]\n", argv[0]);
             return 1;
         }
     }
