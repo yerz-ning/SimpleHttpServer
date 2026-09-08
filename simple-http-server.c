@@ -285,25 +285,37 @@ void url_decode(char *str) {
     *q = '\0';
 }
 
-// 解析 Range 头，支持单个范围，返回 1 表示成功
+// 解析 Range 头，支持单范围，返回 1 表示成功
 int parse_range(const char *headers, long *start, long *end) {
     const char *p = strstr(headers, "Range: bytes=");
     if (!p) return 0;
-    p += 13;
+    p += 13; // 跳过 "Range: bytes="
+
     char *dash = strchr(p, '-');
     if (!dash) return 0;
 
     // 忽略多范围，只取第一个
     char *comma = strchr(p, ',');
-    if (comma && dash > comma) return 0; // 异常
+    if (comma && dash > comma) return 0;
 
-    *start = atol(p);
-    if (*(dash+1) != '\0' && *(dash+1) != ',') {
-        *end = atol(dash+1);
+    char *endptr;
+    errno = 0;
+    *start = strtol(p, &endptr, 10);
+    if (errno != 0 || endptr == p || *start < 0) return 0;
+
+    // 跳过可能的分隔符（如空格）
+    while (*endptr == ' ' || *endptr == '\t') endptr++;
+    if (*endptr != '-') return 0;
+
+    endptr++; // 跳过 '-'
+    // 如果后面有数字，解析 end；否则表示到文件末尾
+    if (isdigit(*endptr)) {
+        errno = 0;
+        *end = strtol(endptr, &endptr, 10);
+        if (errno != 0 || *end < 0) return 0;
     } else {
         *end = -1;
     }
-    if (*start < 0 || (*end != -1 && *end < 0)) return 0;
     return 1;
 }
 
