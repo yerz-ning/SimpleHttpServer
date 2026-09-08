@@ -19,14 +19,30 @@
 #include <time.h>
 #include <signal.h>
 #include <ctype.h>
+#include <pthread.h>
 
 #define BUFFER_SIZE 4096
 #define DEFAULT_PORT 80
 #define BACKLOG 5
+#define MAX_THREADS 16
+#define DEFAULT_THREADS 4
+#define QUEUE_SIZE 1024
+#define STACK_SIZE (256 * 1024)  // 256KB per thread
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
 int log_level = 1; // 默认错误级别
+int num_threads = DEFAULT_THREADS;
+
+// 线程池全局变量
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
+pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
+int queue[QUEUE_SIZE];
+int queue_head = 0, queue_tail = 0, queue_count = 0;
+
+// 日志锁
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 发送全部数据，失败返回 -1
 ssize_t send_all(int fd, const void *buf, size_t len) {
@@ -42,10 +58,6 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
 // 发送响应头
 int send_header(int client, int code, const char *status, const char *type,
                 long content_length, const char *extra) {
-    if (log_level == 0) {
-        printf("响应: %d %s 类型: %s 长度: %ld\n", code, status, type, content_length);
-        printf("Response: %d %s type: %s length: %ld\n", code, status, type, content_length);
-    }
     char header[512];
     int len = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -72,14 +84,18 @@ int send_header(int client, int code, const char *status, const char *type,
 const char* get_mime_type(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return "application/octet-stream";
-    if (strcmp(ext, ".mp4") == 0) return "video/mp4";
+    if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0) return "video/mp4";
+    if (strcmp(ext, ".webm") == 0) return "video/webm";
+    if (strcmp(ext, ".ogg") == 0) return "video/ogg";
     if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0) return "text/html";
     if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0) return "image/jpeg";
     if (strcmp(ext, ".png") == 0) return "image/png";
+    if (strcmp(ext, ".gif") == 0) return "image/gif";
     if (strcmp(ext, ".css") == 0) return "text/css";
     if (strcmp(ext, ".js") == 0) return "application/javascript";
     if (strcmp(ext, ".txt") == 0) return "text/plain";
     if (strcmp(ext, ".mp3") == 0) return "audio/mpeg";
+    if (strcmp(ext, ".wav") == 0) return "audio/wav";
     if (strcmp(ext, ".pdf") == 0) return "application/pdf";
     return "application/octet-stream";
 }
@@ -161,6 +177,13 @@ void send_file_range(int client, const char *path, long start, long end) {
         return;
     }
     long file_size = st.st_size;
+    if (file_size == 0) {
+        close(fd);
+        send_header(client, 416, "Range Not Satisfiable", "text/html", 0, NULL);
+        return;
+    }
+
+    // 规范化 Range
     if (end == -1) end = file_size - 1;
     if (start < 0 || end < 0 || start >= file_size || start > end) {
         close(fd);
@@ -168,6 +191,7 @@ void send_file_range(int client, const char *path, long start, long end) {
         return;
     }
     if (end >= file_size) end = file_size - 1;
+
     long content_length = end - start + 1;
     char extra[128];
     snprintf(extra, sizeof(extra), "Content-Range: bytes %ld-%ld/%ld\r\n", start, end, file_size);
@@ -192,7 +216,7 @@ void send_file_range(int client, const char *path, long start, long end) {
     close(fd);
 }
 
-// 流式目录列表
+// 流式目录列表（使用 Content-Length 未知，直接关闭连接）
 void list_directory(int client, const char *path) {
     DIR *d = opendir(path);
     if (!d) {
@@ -200,7 +224,6 @@ void list_directory(int client, const char *path) {
         return;
     }
 
-    // 先发送头部，使用 Transfer-Encoding: chunked 或直接关闭连接
     char header[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
     if (send_all(client, header, strlen(header)) < 0) {
         closedir(d);
@@ -209,7 +232,7 @@ void list_directory(int client, const char *path) {
 
     char *head = "<!DOCTYPE html><html><head><title>Index</title></head><body><h2>Index of ";
     send_all(client, head, strlen(head));
-    // 显示相对路径
+
     char display_path[1024];
     if (strcmp(path, root_dir) == 0) {
         snprintf(display_path, sizeof(display_path), "/");
@@ -217,6 +240,7 @@ void list_directory(int client, const char *path) {
         snprintf(display_path, sizeof(display_path), "%s/", path + strlen(root_dir));
     }
     send_all(client, display_path, strlen(display_path));
+
     char *mid = "</h2><ul>";
     send_all(client, mid, strlen(mid));
 
@@ -251,6 +275,9 @@ void url_decode(char *str) {
                         (low <= '9' ? low - '0' : low - 'a' + 10);
             *q++ = (char)value;
             p += 3;
+        } else if (*p == '+') {
+            *q++ = ' ';
+            p++;
         } else {
             *q++ = *p++;
         }
@@ -258,15 +285,20 @@ void url_decode(char *str) {
     *q = '\0';
 }
 
-// 解析 Range 头
-long parse_range(const char *headers, long *start, long *end) {
+// 解析 Range 头，支持单个范围，返回 1 表示成功
+int parse_range(const char *headers, long *start, long *end) {
     const char *p = strstr(headers, "Range: bytes=");
     if (!p) return 0;
     p += 13;
     char *dash = strchr(p, '-');
     if (!dash) return 0;
+
+    // 忽略多范围，只取第一个
+    char *comma = strchr(p, ',');
+    if (comma && dash > comma) return 0; // 异常
+
     *start = atol(p);
-    if (*(dash+1) != '\0') {
+    if (*(dash+1) != '\0' && *(dash+1) != ',') {
         *end = atol(dash+1);
     } else {
         *end = -1;
@@ -276,7 +308,7 @@ long parse_range(const char *headers, long *start, long *end) {
 }
 
 // 读取完整 HTTP 头部，直到空行
-int read_http_headers(int client, char *buffer, size_t buf_size, int *total_read) {
+int read_http_headers(int client, char *buffer, size_t buf_size) {
     size_t total = 0;
     while (total < buf_size - 1) {
         ssize_t n = recv(client, buffer + total, buf_size - 1 - total, 0);
@@ -284,38 +316,47 @@ int read_http_headers(int client, char *buffer, size_t buf_size, int *total_read
         total += n;
         buffer[total] = '\0';
         if (strstr(buffer, "\r\n\r\n") != NULL || strstr(buffer, "\n\n") != NULL) {
-            *total_read = total;
             return 0;
         }
     }
     return -1;
 }
 
-// 处理请求
+// 处理单个客户端连接
 void handle_request(int client, struct sockaddr_in *addr) {
     char headers[4096];
-    int total = 0;
-    if (read_http_headers(client, headers, sizeof(headers), &total) < 0) {
+    if (read_http_headers(client, headers, sizeof(headers)) < 0) {
+        close(client);
         return;
     }
 
     // 解析请求行
     char *line_end = strstr(headers, "\r\n");
     if (line_end == NULL) line_end = strstr(headers, "\n");
-    if (line_end == NULL) return;
+    if (line_end == NULL) { close(client); return; }
     char request_line[2048];
     size_t line_len = line_end - headers;
-    if (line_len >= sizeof(request_line)) return;
+    if (line_len >= sizeof(request_line)) { close(client); return; }
     memcpy(request_line, headers, line_len);
     request_line[line_len] = '\0';
 
     char *method = strtok(request_line, " ");
     char *path = strtok(NULL, " ");
-    if (!method || !path) return;
+    if (!method || !path) { close(client); return; }
 
+    // 只处理 GET 和 HEAD 请求
+    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
+        send_header(client, 405, "Method Not Allowed", "text/html", 0, NULL);
+        close(client);
+        return;
+    }
+
+    // 日志
     if (log_level == 0) {
+        pthread_mutex_lock(&log_mutex);
         printf("请求 %s %s (来自 %s)\n", method, path, inet_ntoa(addr->sin_addr));
         printf("Request %s %s (from %s)\n", method, path, inet_ntoa(addr->sin_addr));
+        pthread_mutex_unlock(&log_mutex);
     }
 
     // URL 解码
@@ -325,12 +366,14 @@ void handle_request(int client, struct sockaddr_in *addr) {
     char fullpath[2048];
     if (build_safe_path(root_dir, path, fullpath, sizeof(fullpath)) < 0) {
         send_header(client, 403, "Forbidden", "text/html", 0, NULL);
+        close(client);
         return;
     }
 
     struct stat st;
     if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
         list_directory(client, fullpath);
+        close(client);
         return;
     }
 
@@ -340,13 +383,51 @@ void handle_request(int client, struct sockaddr_in *addr) {
     } else {
         send_file_complete(client, fullpath);
     }
+    close(client);
 }
 
-// 程序入口
+// 线程工作函数
+void *worker_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&queue_mutex);
+        while (queue_count == 0) {
+            pthread_cond_wait(&queue_not_empty, &queue_mutex);
+        }
+        int client = queue[queue_head];
+        queue_head = (queue_head + 1) % QUEUE_SIZE;
+        queue_count--;
+        pthread_cond_signal(&queue_not_full);
+        pthread_mutex_unlock(&queue_mutex);
+
+        // 获取客户端地址（仅用于日志）
+        struct sockaddr_in addr;
+        socklen_t len = sizeof(addr);
+        getpeername(client, (struct sockaddr*)&addr, &len);
+        handle_request(client, &addr);
+        // handle_request 内部已关闭 client
+    }
+    return NULL;
+}
+
+// 将客户端 socket 加入队列
+void enqueue_client(int client) {
+    pthread_mutex_lock(&queue_mutex);
+    while (queue_count == QUEUE_SIZE) {
+        pthread_cond_wait(&queue_not_full, &queue_mutex);
+    }
+    queue[queue_tail] = client;
+    queue_tail = (queue_tail + 1) % QUEUE_SIZE;
+    queue_count++;
+    pthread_cond_signal(&queue_not_empty);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
 int main(int argc, char *argv[]) {
     // 忽略 SIGPIPE，防止客户端断开导致进程退出
     signal(SIGPIPE, SIG_IGN);
 
+    // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
             port = atoi(argv[++i]);
@@ -354,12 +435,17 @@ int main(int argc, char *argv[]) {
             root_dir = argv[++i];
         } else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) {
             if (strcmp(argv[++i], "info") == 0) log_level = 0;
+        } else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) {
+            num_threads = atoi(argv[++i]);
+            if (num_threads < 1) num_threads = 1;
+            if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
         } else {
-            fprintf(stderr, "用法: %s [-p port] [-r root_dir] [-l info]\n", argv[0]);
+            fprintf(stderr, "用法: %s [-p port] [-r root_dir] [-l info] [-t threads]\n", argv[0]);
             return 1;
         }
     }
 
+    // 创建监听 socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return 1; }
     int reuse = 1;
@@ -372,26 +458,36 @@ int main(int argc, char *argv[]) {
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(sock, BACKLOG) < 0) { perror("listen"); return 1; }
 
-    printf("HTTP 服务器启动 端口 %d 根目录 %s\n", port, root_dir);
-    printf("HTTP server started port %d serving %s\n", port, root_dir);
+    printf("HTTP 服务器启动 端口 %d 根目录 %s 线程数 %d\n", port, root_dir, num_threads);
+    printf("HTTP server started port %d serving %s threads %d\n", port, root_dir, num_threads);
     printf("日志级别: %s\n", log_level == 0 ? "info" : "error");
 
-    fd_set readfds;
-    struct timeval tv;
-    while (1) {
-        FD_ZERO(&readfds);
-        FD_SET(sock, &readfds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        if (select(sock+1, &readfds, NULL, NULL, &tv) <= 0) continue;
+    // 创建工作线程
+    pthread_t threads[MAX_THREADS];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, STACK_SIZE);
+    for (int i = 0; i < num_threads; i++) {
+        if (pthread_create(&threads[i], &attr, worker_thread, NULL) != 0) {
+            perror("pthread_create");
+            return 1;
+        }
+    }
+    pthread_attr_destroy(&attr);
 
+    // 主循环：接受连接并放入队列
+    while (1) {
         struct sockaddr_in client_addr;
         socklen_t len = sizeof(client_addr);
         int client = accept(sock, (struct sockaddr *)&client_addr, &len);
-        if (client < 0) continue;
-        handle_request(client, &client_addr);
-        close(client);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            continue;
+        }
+        enqueue_client(client);
     }
+
     close(sock);
     return 0;
 }
