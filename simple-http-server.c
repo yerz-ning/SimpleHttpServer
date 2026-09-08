@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <signal.h>
 
 #define BUFFER_SIZE 4096
@@ -24,23 +25,26 @@
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
+int log_level = 1; // 默认错误级别
 
-// 发送所有数据，失败返回 -1
+// 发送全部数据，失败返回 -1
 ssize_t send_all(int fd, const void *buf, size_t len) {
     ssize_t total = 0;
     while (total < (ssize_t)len) {
         ssize_t n = send(fd, (char*)buf + total, len - total, 0);
-        if (n <= 0) {
-            return -1;  // 发送失败
-        }
+        if (n <= 0) return -1;
         total += n;
     }
     return total;
 }
 
-// 发送响应头，失败返回 -1
-int send_response(int client, int code, const char *status, const char *type,
-                  long content_length, const char *extra) {
+// 发送响应头
+int send_header(int client, int code, const char *status, const char *type,
+                long content_length, const char *extra) {
+    if (log_level == 0) {
+        printf("响应: %d %s 类型: %s 长度: %ld\n", code, status, type, content_length);
+        printf("Response: %d %s type: %s length: %ld\n", code, status, type, content_length);
+    }
     char header[512];
     int len = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -50,11 +54,10 @@ int send_response(int client, int code, const char *status, const char *type,
         "%s"
         "\r\n",
         code, status, type, content_length, extra ? extra : "");
-    if (send_all(client, header, len) < 0) return -1;
-    return 0;
+    return send_all(client, header, len);
 }
 
-// 获取 MIME 类型
+// MIME 类型
 const char* get_mime_type(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return "application/octet-stream";
@@ -67,31 +70,77 @@ const char* get_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
-// 响应 Range 请求，发送文件的指定字节范围
-void send_file_range(int client, const char *path, long start, long end) {
+// 发送文件完整内容（流式）
+void send_file_complete(int client, const char *path) {
+    if (log_level == 0) {
+        printf("打开文件 %s\n", path);
+        printf("Opening file %s\n", path);
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        send_response(client, 404, "Not Found", "text/html", 0, NULL);
+        if (log_level == 0) {
+            printf("文件不存在 %s\n", path);
+            printf("File not found %s\n", path);
+        }
+        send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
-        send_response(client, 500, "Internal Error", "text/html", 0, NULL);
+        send_header(client, 500, "Internal Error", "text/html", 0, NULL);
+        return;
+    }
+    if (send_header(client, 200, "OK", get_mime_type(path), st.st_size, NULL) < 0) {
+        close(fd);
+        return;
+    }
+    char buf[BUFFER_SIZE];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        if (send_all(client, buf, n) < 0) break;
+    }
+    close(fd);
+    if (log_level == 0) {
+        printf("文件发送完成 %s\n", path);
+        printf("File sent %s\n", path);
+    }
+}
+
+// 发送文件部分内容（Range 请求）
+void send_file_range(int client, const char *path, long start, long end) {
+    if (log_level == 0) {
+        printf("打开文件 %s Range: %ld-%ld\n", path, start, end);
+        printf("Opening file %s Range: %ld-%ld\n", path, start, end);
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        if (log_level == 0) {
+            printf("文件不存在 %s\n", path);
+            printf("File not found %s\n", path);
+        }
+        send_header(client, 404, "Not Found", "text/html", 0, NULL);
+        return;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        send_header(client, 500, "Internal Error", "text/html", 0, NULL);
         return;
     }
     long file_size = st.st_size;
     if (end == -1) end = file_size - 1;
     if (start > end || start >= file_size) {
         close(fd);
-        send_response(client, 416, "Range Not Satisfiable", "text/html", 0, NULL);
+        send_header(client, 416, "Range Not Satisfiable", "text/html", 0, NULL);
         return;
     }
     if (end >= file_size) end = file_size - 1;
     long content_length = end - start + 1;
     char extra[128];
     snprintf(extra, sizeof(extra), "Content-Range: bytes %ld-%ld/%ld\r\n", start, end, file_size);
-    if (send_response(client, 206, "Partial Content", get_mime_type(path), content_length, extra) < 0) {
+
+    if (send_header(client, 206, "Partial Content", get_mime_type(path), content_length, extra) < 0) {
         close(fd);
         return;
     }
@@ -106,45 +155,29 @@ void send_file_range(int client, const char *path, long start, long end) {
         remaining -= n;
     }
     close(fd);
+    if (log_level == 0) {
+        printf("Range 发送完成 %s\n", path);
+        printf("Range sent %s\n", path);
+    }
 }
 
-// 以流式方式发送完整的文件内容
-void send_file_complete(int client, const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        send_response(client, 404, "Not Found", "text/html", 0, NULL);
-        return;
-    }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        send_response(client, 500, "Internal Error", "text/html", 0, NULL);
-        return;
-    }
-    if (send_response(client, 200, "OK", get_mime_type(path), st.st_size, NULL) < 0) {
-        close(fd);
-        return;
-    }
-    char buf[BUFFER_SIZE];
-    ssize_t n;
-    while ((n = read(fd, buf, sizeof(buf))) > 0) {
-        if (send_all(client, buf, n) < 0) break;
-    }
-    close(fd);
-}
-
-// 流式生成目录列表
+// 流式目录列表
 void list_directory(int client, const char *path) {
+    if (log_level == 0) {
+        printf("列出目录 %s\n", path);
+        printf("Listing directory %s\n", path);
+    }
     DIR *d = opendir(path);
     if (!d) {
-        send_response(client, 404, "Not Found", "text/html", 0, NULL);
+        send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
-    const char *head = "<!DOCTYPE html><html><head><meta charset=utf-8><title>File list</title></head><body><h2>Index of ";
-    if (send_all(client, head, strlen(head)) < 0) { closedir(d); return; }
-    if (send_all(client, path, strlen(path)) < 0) { closedir(d); return; }
-    const char *mid = "</h2><ul>";
-    if (send_all(client, mid, strlen(mid)) < 0) { closedir(d); return; }
+    char *head = "<!DOCTYPE html><html><head><title>Index</title></head><body><h2>Index of ";
+    send_all(client, head, strlen(head));
+    send_all(client, path, strlen(path));
+    char *mid = "</h2><ul>";
+    send_all(client, mid, strlen(mid));
+
     struct dirent *entry;
     char fullpath[512];
     while ((entry = readdir(d))) {
@@ -158,15 +191,31 @@ void list_directory(int client, const char *path) {
         } else {
             snprintf(line, sizeof(line), "<li><a href=\"%s\">%s</a></li>", entry->d_name, entry->d_name);
         }
-        if (send_all(client, line, strlen(line)) < 0) { closedir(d); return; }
+        send_all(client, line, strlen(line));
     }
-    const char *tail = "</ul></body></html>";
+    char *tail = "</ul></body></html>";
     send_all(client, tail, strlen(tail));
     closedir(d);
 }
 
+// 解析 Range 头
+long parse_range(const char *headers, long *start, long *end) {
+    const char *p = strstr(headers, "Range: bytes=");
+    if (!p) return 0;
+    p += 13;
+    char *dash = strchr(p, '-');
+    if (!dash) return 0;
+    *start = atol(p);
+    if (*(dash+1) != '\0') {
+        *end = atol(dash+1);
+    } else {
+        *end = -1;
+    }
+    return 1;
+}
+
 // 处理请求
-void handle_request(int client) {
+void handle_request(int client, struct sockaddr_in *addr) {
     char buf[BUFFER_SIZE];
     int n = recv(client, buf, sizeof(buf)-1, 0);
     if (n <= 0) return;
@@ -176,18 +225,22 @@ void handle_request(int client) {
     char *path = strtok(NULL, " ");
     if (!method || !path) return;
 
-    long start = 0, end = -1;
-    int has_range = 0;
-    char *range_header = strstr(buf, "Range: bytes=");
-    if (range_header) {
-        range_header += 13;
-        char *dash = strchr(range_header, '-');
-        if (dash) {
-            start = atol(range_header);
-            if (*(dash+1) != '\0') end = atol(dash+1);
-            else end = -1;
-            has_range = 1;
-        }
+    if (log_level == 0) {
+        printf("请求 %s %s (来自 %s)\n", method, path, inet_ntoa(addr->sin_addr));
+        printf("Request %s %s (from %s)\n", method, path, inet_ntoa(addr->sin_addr));
+    }
+
+    // 读取剩余请求头
+    char headers[2048] = {0};
+    int total = 0;
+    while (1) {
+        n = recv(client, buf, sizeof(buf)-1, 0);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        total += n;
+        if (total >= (int)sizeof(headers)-1) break;
+        strcat(headers, buf);
+        if (strstr(headers, "\r\n\r\n") || strstr(headers, "\n\n")) break;
     }
 
     char fullpath[1024];
@@ -203,30 +256,24 @@ void handle_request(int client) {
         return;
     }
 
-    // 文件不存在或不可读
-    if (stat(fullpath, &st) != 0) {
-        send_response(client, 404, "Not Found", "text/html", 0, NULL);
-        return;
-    }
-
-    if (has_range) {
+    long start = 0, end = -1;
+    if (parse_range(headers, &start, &end)) {
         send_file_range(client, fullpath, start, end);
     } else {
         send_file_complete(client, fullpath);
     }
 }
 
+// 程序入口
 int main(int argc, char *argv[]) {
-    // 忽略 SIGPIPE，防止客户端断开时进程崩溃
-    signal(SIGPIPE, SIG_IGN);
-
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
             port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-r") == 0 && i+1 < argc) {
             root_dir = argv[++i];
+        } else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) {
+            if (strcmp(argv[++i], "info") == 0) log_level = 0;
         } else {
-            printf("Usage: %s [-p port] [-r root_dir]\n", argv[0]);
             return 1;
         }
     }
@@ -243,16 +290,24 @@ int main(int argc, char *argv[]) {
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(sock, BACKLOG) < 0) { perror("listen"); return 1; }
 
-    printf("HTTP server running on port %d, serving %s\n", port, root_dir);
+    printf("HTTP 服务器启动 端口 %d 根目录 %s\n", port, root_dir);
+    printf("HTTP server started port %d serving %s\n", port, root_dir);
+    printf("日志级别: %s\n", log_level == 0 ? "info" : "error");
 
+    fd_set readfds;
+    struct timeval tv;
     while (1) {
-        int client = accept(sock, NULL, NULL);
-        if (client < 0) {
-            if (errno == EINTR) continue;
-            perror("accept");
-            continue;
-        }
-        handle_request(client);
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        if (select(sock+1, &readfds, NULL, NULL, &tv) <= 0) continue;
+
+        struct sockaddr_in client_addr;
+        socklen_t len = sizeof(client_addr);
+        int client = accept(sock, (struct sockaddr *)&client_addr, &len);
+        if (client < 0) continue;
+        handle_request(client, &client_addr);
         close(client);
     }
     close(sock);
