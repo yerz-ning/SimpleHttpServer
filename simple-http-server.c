@@ -74,12 +74,15 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
     return total;
 }
 
-// 判断 extra 里是否混进了 CR/LF，防止响应头被撕开
+// 检查 extra 中间是否混进了 CR/LF，末尾的 \r\n 是正常的
 static int has_crlf(const char *s) {
     if (!s) return 0;
-    while (*s) {
-        if (*s == '\r' || *s == '\n') return 1;
-        s++;
+    size_t len = strlen(s);
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\r' || s[i] == '\n') {
+            if (i == len - 2 && s[i] == '\r' && s[i+1] == '\n') break;
+            return 1;
+        }
     }
     return 0;
 }
@@ -87,7 +90,7 @@ static int has_crlf(const char *s) {
 // 发送响应头
 int send_header(int client, int code, const char *status, const char *type,
                 long content_length, const char *extra) {
-    // extra 里一旦有换行就直接丢掉，避免注入
+    // extra 中间一旦有换行就直接丢掉，避免注入
     if (has_crlf(extra)) extra = NULL;
 
     char header[512];
