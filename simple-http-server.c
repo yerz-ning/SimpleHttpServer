@@ -32,6 +32,8 @@
 #define AUTH_FILE ".httpserver_auth"
 #define SESSION_MAX 256
 #define SESSION_TTL 3600  // session 存活秒数
+#define RECV_TIMEOUT 10   // 单次 recv 阻塞上限（秒）
+#define HEADER_TIMEOUT 15 // 读完整个头部的上限（秒）
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
@@ -619,7 +621,10 @@ int do_auth(int client, char *headers) {
 // 读取完整 HTTP 头部，直到空行
 int read_http_headers(int client, char *buffer, size_t buf_size) {
     size_t total = 0;
+    time_t start = time(NULL);
     while (total < buf_size - 1) {
+        // 整段头部的总耗时上限，防慢速攻击
+        if (time(NULL) - start > HEADER_TIMEOUT) return -1;
         ssize_t n = recv(client, buffer + total, buf_size - 1 - total, 0);
         if (n <= 0) return -1;
         total += n;
@@ -633,6 +638,12 @@ int read_http_headers(int client, char *buffer, size_t buf_size) {
 
 // 处理单个客户端连接
 void handle_request(int client, struct sockaddr_in *addr) {
+    // recv 单次阻塞上限，慢速攻击靠这个兜底
+    struct timeval tv;
+    tv.tv_sec = RECV_TIMEOUT;
+    tv.tv_usec = 0;
+    setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     char headers[4096];
     if (read_http_headers(client, headers, sizeof(headers)) < 0) {
         close(client);
