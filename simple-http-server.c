@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/socket.h>
@@ -28,11 +29,15 @@
 #define DEFAULT_THREADS 4
 #define QUEUE_SIZE 1024
 #define STACK_SIZE (256 * 1024)  // 256KB per thread
+#define AUTH_FILE ".httpserver_auth"
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
 int log_level = 1; // 默认错误级别
 int num_threads = DEFAULT_THREADS;
+
+// 密码哈希，空字符串表示不启用
+char auth_hash[128] = "";
 
 // 线程池全局变量
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -319,6 +324,190 @@ int parse_range(const char *headers, long *start, long *end) {
     return 1;
 }
 
+// 对密码做哈希，拼两个不同的 64 位结果
+void hash_password(const char *password, char *out, size_t out_size) {
+    unsigned long long h1 = 1469598103934665603ULL;
+    unsigned long long h2 = 0x9e3779b97f4a7c15ULL;
+    for (const char *p = password; *p; p++) {
+        h1 ^= (unsigned char)*p;
+        h1 *= 1099511628211ULL;
+        h2 ^= (unsigned char)*p;
+        h2 *= 0x100000001b3ULL;
+        h2 ^= h2 >> 29;
+    }
+    h1 ^= strlen(password);
+    snprintf(out, out_size, "%016llx%016llx", h1, h2);
+}
+
+// 读取保存的密码，返回 1 表示文件里有内容
+int load_auth_file(void) {
+    FILE *f = fopen(AUTH_FILE, "r");
+    if (!f) return 0;
+    char line[256];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return 0; }
+    fclose(f);
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = '\0';
+    if (strcmp(line, "nopass") == 0) return 1;
+    if (line[0]) {
+        strncpy(auth_hash, line, sizeof(auth_hash) - 1);
+        return 1;
+    }
+    return 0;
+}
+
+// 保存密码或标记
+void save_auth_file(const char *content) {
+    FILE *f = fopen(AUTH_FILE, "w");
+    if (!f) return;
+    fprintf(f, "%s\n", content);
+    fclose(f);
+}
+
+// 交互式设置密码
+void prompt_set_password(void) {
+    char pwd[256], confirm[256];
+    printf("输入新密码: ");
+    fflush(stdout);
+    if (!fgets(pwd, sizeof(pwd), stdin)) return;
+    char *nl = strchr(pwd, '\n');
+    if (nl) *nl = '\0';
+    printf("再输入一次: ");
+    fflush(stdout);
+    if (!fgets(confirm, sizeof(confirm), stdin)) return;
+    nl = strchr(confirm, '\n');
+    if (nl) *nl = '\0';
+    if (strcmp(pwd, confirm) != 0) {
+        printf("两次不一致，取消\n");
+        return;
+    }
+    if (pwd[0] == '\0') {
+        printf("密码为空，取消\n");
+        return;
+    }
+    hash_password(pwd, auth_hash, sizeof(auth_hash));
+    save_auth_file(auth_hash);
+    printf("密码已设置\n");
+}
+
+// 启动时决定密码策略
+void init_auth(int force_set) {
+    if (force_set) {
+        prompt_set_password();
+        return;
+    }
+    if (load_auth_file()) return; // 已有记录，直接用
+
+    // 第一次启动，没记录，问一下
+    if (!isatty(0)) return;
+    printf("还没设置访问密码，现在设置吗？[y/N] ");
+    fflush(stdout);
+    char buf[16];
+    if (!fgets(buf, sizeof(buf), stdin)) return;
+    if (buf[0] == 'y' || buf[0] == 'Y') {
+        prompt_set_password();
+    } else {
+        save_auth_file("nopass");
+        printf("已跳过\n");
+    }
+}
+
+// 从 Cookie 里取 auth 值
+int get_auth_cookie(const char *headers, char *out, size_t out_size) {
+    const char *p = headers;
+    while ((p = strstr(p, "auth=")) != NULL) {
+        if (p != headers && p[-1] != ' ' && p[-1] != ';' && p[-1] != '\t') {
+            p += 5;
+            continue;
+        }
+        p += 5;
+        size_t i = 0;
+        while (*p && *p != ';' && *p != '\r' && *p != '\n' && *p != ' ' && i < out_size - 1) {
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+// 从请求体里找 password 字段
+int get_form_password(const char *body, char *out, size_t out_size) {
+    const char *p = body;
+    while ((p = strstr(p, "password=")) != NULL) {
+        if (p != body && p[-1] != '&' && p[-1] != '\r' && p[-1] != '\n' && p[-1] != ' ') {
+            p++;
+            continue;
+        }
+        p += 9;
+        size_t i = 0;
+        while (*p && *p != '&' && *p != '\r' && *p != '\n' && *p != ' ' && i < out_size - 1) {
+            out[i++] = *p++;
+        }
+        out[i] = '\0';
+        url_decode(out);
+        return 1;
+    }
+    return 0;
+}
+
+// 登录页面
+void send_login_page(int client, int bad) {
+    char body[1024];
+    int len = snprintf(body, sizeof(body),
+        "<!DOCTYPE html><html><head><title>Login</title></head><body>"
+        "<h2>需要密码</h2>"
+        "%s"
+        "<form method=\"POST\" action=\"/\">"
+        "<input type=\"password\" name=\"password\" placeholder=\"密码\" autofocus>"
+        "<button type=\"submit\">登录</button>"
+        "</form></body></html>",
+        bad ? "<p style=\"color:red\">密码错误</p>" : "");
+    send_header(client, bad ? 401 : 200, bad ? "Unauthorized" : "OK",
+                "text/html", len, NULL);
+    send_all(client, body, len);
+}
+
+// 认证检查，返回 1 表示已处理完连接
+int do_auth(int client, char *headers) {
+    if (auth_hash[0] == '\0') return 0;
+
+    char token[64];
+    if (get_auth_cookie(headers, token, sizeof(token))) {
+        if (strcmp(token, auth_hash) == 0) return 0;
+    }
+
+    // 登录尝试
+    if (strncmp(headers, "POST ", 5) == 0) {
+        char *body = strstr(headers, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            char pwd[256];
+            if (get_form_password(body, pwd, sizeof(pwd))) {
+                char h[128];
+                hash_password(pwd, h, sizeof(h));
+                if (strcmp(h, auth_hash) == 0) {
+                    char extra[256];
+                    snprintf(extra, sizeof(extra),
+                        "Set-Cookie: auth=%s; Path=/; HttpOnly\r\n", auth_hash);
+                    char resp[] = "<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0;url=/\"></head><body>OK</body></html>";
+                    send_header(client, 200, "OK", "text/html", strlen(resp), extra);
+                    send_all(client, resp, strlen(resp));
+                    close(client);
+                    return 1;
+                }
+            }
+        }
+        send_login_page(client, 1);
+        close(client);
+        return 1;
+    }
+
+    send_login_page(client, 0);
+    close(client);
+    return 1;
+}
+
 // 读取完整 HTTP 头部，直到空行
 int read_http_headers(int client, char *buffer, size_t buf_size) {
     size_t total = 0;
@@ -341,6 +530,9 @@ void handle_request(int client, struct sockaddr_in *addr) {
         close(client);
         return;
     }
+
+    // 认证检查
+    if (do_auth(client, headers)) return;
 
     // 解析请求行
     char *line_end = strstr(headers, "\r\n");
@@ -439,6 +631,8 @@ int main(int argc, char *argv[]) {
     // 忽略 SIGPIPE，防止客户端断开导致进程退出
     signal(SIGPIPE, SIG_IGN);
 
+    int force_set = 0;
+
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
@@ -451,11 +645,16 @@ int main(int argc, char *argv[]) {
             num_threads = atoi(argv[++i]);
             if (num_threads < 1) num_threads = 1;
             if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+        } else if (strcasecmp(argv[i], "-pass") == 0) {
+            force_set = 1;
         } else {
-            fprintf(stderr, "用法: %s [-p port] [-r root_dir] [-l info] [-t threads]\n", argv[0]);
+            fprintf(stderr, "用法: %s [-p port] [-r root_dir] [-l info] [-t threads] [-pass]\n", argv[0]);
             return 1;
         }
     }
+
+    // 处理密码
+    init_auth(force_set);
 
     // 创建监听 socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -473,6 +672,7 @@ int main(int argc, char *argv[]) {
     printf("HTTP 服务器启动 端口 %d 根目录 %s 线程数 %d\n", port, root_dir, num_threads);
     printf("HTTP server started port %d serving %s threads %d\n", port, root_dir, num_threads);
     printf("日志级别: %s\n", log_level == 0 ? "info" : "error");
+    printf("访问密码: %s\n", auth_hash[0] ? "已启用" : "未启用");
 
     // 创建工作线程
     pthread_t threads[MAX_THREADS];
