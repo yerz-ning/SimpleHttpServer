@@ -30,6 +30,8 @@
 #define QUEUE_SIZE 1024
 #define STACK_SIZE (256 * 1024)  // 256KB per thread
 #define AUTH_FILE ".httpserver_auth"
+#define SESSION_MAX 256
+#define SESSION_TTL 3600  // session 存活秒数
 
 char *root_dir = ".";
 int port = DEFAULT_PORT;
@@ -38,6 +40,16 @@ int num_threads = DEFAULT_THREADS;
 
 // 密码哈希，空字符串表示不启用
 char auth_hash[128] = "";
+
+// session 池
+typedef struct {
+    char token[65];
+    time_t expire;
+} Session;
+
+Session sessions[SESSION_MAX];
+int session_count = 0;
+pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 线程池全局变量
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -60,9 +72,22 @@ ssize_t send_all(int fd, const void *buf, size_t len) {
     return total;
 }
 
+// 判断 extra 里是否混进了 CR/LF，防止响应头被撕开
+static int has_crlf(const char *s) {
+    if (!s) return 0;
+    while (*s) {
+        if (*s == '\r' || *s == '\n') return 1;
+        s++;
+    }
+    return 0;
+}
+
 // 发送响应头
 int send_header(int client, int code, const char *status, const char *type,
                 long content_length, const char *extra) {
+    // extra 里一旦有换行就直接丢掉，避免注入
+    if (has_crlf(extra)) extra = NULL;
+
     char header[512];
     int len = snprintf(header, sizeof(header),
         "HTTP/1.1 %d %s\r\n"
@@ -88,7 +113,7 @@ int send_header(int client, int code, const char *status, const char *type,
 // MIME 类型
 const char* get_mime_type(const char *path) {
     const char *ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
+    if (!ext || strchr(ext, '/')) return "application/octet-stream";
     if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0) return "video/mp4";
     if (strcmp(ext, ".webm") == 0) return "video/webm";
     if (strcmp(ext, ".ogg") == 0) return "video/ogg";
@@ -105,51 +130,68 @@ const char* get_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
-// 安全构建路径，防止目录遍历
-int build_safe_path(const char *root, const char *url_path, char *out, size_t out_size) {
+// 逐级打开路径，每级都用 O_NOFOLLOW 拒绝符号链接
+// 成功返回 fd，out 里放拼出来的完整路径，失败返回 -1
+int open_safe_path(const char *root, const char *url_path, char *out, size_t out_size) {
     char abs_root[1024];
     if (realpath(root, abs_root) == NULL) {
         if (mkdir(root, 0755) != 0 && errno != EEXIST) return -1;
         if (realpath(root, abs_root) == NULL) return -1;
     }
 
-    char combined[2048];
-    int len = snprintf(combined, sizeof(combined), "%s%s", abs_root, url_path);
-    if (len < 0 || len >= (int)sizeof(combined)) return -1;
+    int cur_fd = open(abs_root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (cur_fd < 0) return -1;
 
-    char resolved[2048];
-    if (realpath(combined, resolved) == NULL) {
-        // 文件/目录不存在，尝试规范化父目录
-        char copy[2048];
-        strncpy(copy, combined, sizeof(copy)-1);
-        copy[sizeof(copy)-1] = '\0';
-        char *last_slash = strrchr(copy, '/');
-        if (last_slash == NULL) return -1;
-        *last_slash = '\0';
-        char parent[2048];
-        if (realpath(copy, parent) == NULL) return -1;
-        size_t root_len = strlen(abs_root);
-        if (strncmp(parent, abs_root, root_len) != 0 ||
-            (parent[root_len] != '\0' && parent[root_len] != '/')) return -1;
-        snprintf(out, out_size, "%s/%s", parent, last_slash + 1);
-        return 0;
+    int shown = snprintf(out, out_size, "%s", abs_root);
+    if (shown < 0 || (size_t)shown >= out_size) {
+        close(cur_fd);
+        return -1;
     }
 
-    size_t root_len = strlen(abs_root);
-    if (strncmp(resolved, abs_root, root_len) != 0 ||
-        (resolved[root_len] != '\0' && resolved[root_len] != '/')) return -1;
+    char path_copy[2048];
+    if (strlen(url_path) >= sizeof(path_copy)) {
+        close(cur_fd);
+        return -1;
+    }
+    strcpy(path_copy, url_path);
 
-    snprintf(out, out_size, "%s", resolved);
-    return 0;
+    char *save = NULL;
+    char *tok = strtok_r(path_copy, "/", &save);
+    while (tok) {
+        // 不允许 .. 跳出根目录
+        if (strcmp(tok, "..") == 0) {
+            close(cur_fd);
+            errno = EACCES;
+            return -1;
+        }
+        char *next = strtok_r(NULL, "/", &save);
+        int flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+        if (next) flags |= O_DIRECTORY;
+        int nfd = openat(cur_fd, tok, flags);
+        if (nfd < 0) {
+            int e = errno;
+            close(cur_fd);
+            errno = e;
+            return -1;
+        }
+        close(cur_fd);
+        cur_fd = nfd;
+
+        int n = snprintf(out + shown, out_size - shown, "/%s", tok);
+        if (n < 0 || (size_t)n >= out_size - shown) {
+            close(cur_fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        shown += n;
+        tok = next;
+    }
+
+    return cur_fd;
 }
 
 // 发送文件完整内容（流式）
-void send_file_complete(int client, const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        send_header(client, 404, "Not Found", "text/html", 0, NULL);
-        return;
-    }
+void send_file_complete(int client, int fd, const char *path) {
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
@@ -169,12 +211,7 @@ void send_file_complete(int client, const char *path) {
 }
 
 // 发送文件部分内容（Range 请求）
-void send_file_range(int client, const char *path, long start, long end) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        send_header(client, 404, "Not Found", "text/html", 0, NULL);
-        return;
-    }
+void send_file_range(int client, int fd, const char *path, long start, long end) {
     struct stat st;
     if (fstat(fd, &st) != 0) {
         close(fd);
@@ -222,9 +259,10 @@ void send_file_range(int client, const char *path, long start, long end) {
 }
 
 // 流式目录列表（使用 Content-Length 未知，直接关闭连接）
-void list_directory(int client, const char *path) {
-    DIR *d = opendir(path);
+void list_directory(int client, int dir_fd, const char *path) {
+    DIR *d = fdopendir(dir_fd);
     if (!d) {
+        close(dir_fd);
         send_header(client, 404, "Not Found", "text/html", 0, NULL);
         return;
     }
@@ -273,9 +311,9 @@ void list_directory(int client, const char *path) {
 void url_decode(char *str) {
     char *p = str, *q = str;
     while (*p) {
-        if (*p == '%' && isxdigit(*(p+1)) && isxdigit(*(p+2))) {
-            int high = tolower(*(p+1));
-            int low = tolower(*(p+2));
+        if (*p == '%' && isxdigit((unsigned char)*(p+1)) && isxdigit((unsigned char)*(p+2))) {
+            int high = tolower((unsigned char)*(p+1));
+            int low = tolower((unsigned char)*(p+2));
             int value = (high <= '9' ? high - '0' : high - 'a' + 10) * 16 +
                         (low <= '9' ? low - '0' : low - 'a' + 10);
             *q++ = (char)value;
@@ -306,7 +344,7 @@ int parse_range(const char *headers, long *start, long *end) {
     char *endptr;
     errno = 0;
     *start = strtol(p, &endptr, 10);
-    if (errno != 0 || endptr == p || *start < 0) return 0;
+    if (errno == ERANGE || endptr == p || *start < 0) return 0;
 
     // 跳过可能的分隔符（如空格）
     while (*endptr == ' ' || *endptr == '\t') endptr++;
@@ -314,10 +352,10 @@ int parse_range(const char *headers, long *start, long *end) {
 
     endptr++; // 跳过 '-'
     // 如果后面有数字，解析 end；否则表示到文件末尾
-    if (isdigit(*endptr)) {
+    if (isdigit((unsigned char)*endptr)) {
         errno = 0;
         *end = strtol(endptr, &endptr, 10);
-        if (errno != 0 || *end < 0) return 0;
+        if (errno == ERANGE || *end < 0) return 0;
     } else {
         *end = -1;
     }
@@ -350,7 +388,10 @@ int load_auth_file(void) {
     if (nl) *nl = '\0';
     if (strcmp(line, "nopass") == 0) return 1;
     if (line[0]) {
-        strncpy(auth_hash, line, sizeof(auth_hash) - 1);
+        size_t n = strlen(line);
+        if (n >= sizeof(auth_hash)) n = sizeof(auth_hash) - 1;
+        memcpy(auth_hash, line, n);
+        auth_hash[n] = '\0';
         return 1;
     }
     return 0;
@@ -410,6 +451,70 @@ void init_auth(int force_set) {
         save_auth_file("nopass");
         printf("已跳过\n");
     }
+}
+
+// 生成随机的 session token
+void make_session(char *out, size_t out_size) {
+    unsigned char buf[32];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        close(fd);
+        if (r == (ssize_t)sizeof(buf)) {
+            static const char hex[] = "0123456789abcdef";
+            size_t n = sizeof(buf) * 2;
+            if (n > out_size - 1) n = out_size - 1;
+            for (size_t i = 0; i < n / 2; i++) {
+                out[i*2]   = hex[buf[i] >> 4];
+                out[i*2+1] = hex[buf[i] & 0xf];
+            }
+            out[n] = '\0';
+            return;
+        }
+    }
+    // 拿不到随机数就退而求其次，别让程序挂了
+    static unsigned long counter = 0;
+    snprintf(out, out_size, "%08lx%08lx%08lx",
+             (unsigned long)time(NULL),
+             (unsigned long)getpid(),
+             counter++);
+}
+
+// 登记新 session，顺手把过期的清掉
+void add_session(const char *token) {
+    pthread_mutex_lock(&session_mutex);
+    time_t now = time(NULL);
+    int j = 0;
+    for (int i = 0; i < session_count; i++) {
+        if (sessions[i].expire > now) sessions[j++] = sessions[i];
+    }
+    session_count = j;
+
+    if (session_count >= SESSION_MAX) {
+        // 挤掉第一个
+        sessions[0] = sessions[session_count - 1];
+        session_count--;
+    }
+    strncpy(sessions[session_count].token, token, sizeof(sessions[0].token) - 1);
+    sessions[session_count].token[sizeof(sessions[0].token) - 1] = '\0';
+    sessions[session_count].expire = now + SESSION_TTL;
+    session_count++;
+    pthread_mutex_unlock(&session_mutex);
+}
+
+// 查 token 是不是有效且没过期
+int check_session(const char *token) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&session_mutex);
+    int found = 0;
+    for (int i = 0; i < session_count; i++) {
+        if (sessions[i].expire > now && strcmp(sessions[i].token, token) == 0) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&session_mutex);
+    return found;
 }
 
 // 从 Cookie 里取 auth 值
@@ -472,9 +577,9 @@ void send_login_page(int client, int bad) {
 int do_auth(int client, char *headers) {
     if (auth_hash[0] == '\0') return 0;
 
-    char token[64];
+    char token[128];
     if (get_auth_cookie(headers, token, sizeof(token))) {
-        if (strcmp(token, auth_hash) == 0) return 0;
+        if (check_session(token)) return 0;
     }
 
     // 登录尝试
@@ -487,9 +592,12 @@ int do_auth(int client, char *headers) {
                 char h[128];
                 hash_password(pwd, h, sizeof(h));
                 if (strcmp(h, auth_hash) == 0) {
+                    char sess[128];
+                    make_session(sess, sizeof(sess));
+                    add_session(sess);
                     char extra[256];
                     snprintf(extra, sizeof(extra),
-                        "Set-Cookie: auth=%s; Path=/; HttpOnly\r\n", auth_hash);
+                        "Set-Cookie: auth=%s; Path=/; HttpOnly\r\n", sess);
                     char resp[] = "<!DOCTYPE html><html><head><meta http-equiv=\"refresh\" content=\"0;url=/\"></head><body>OK</body></html>";
                     send_header(client, 200, "OK", "text/html", strlen(resp), extra);
                     send_all(client, resp, strlen(resp));
@@ -566,26 +674,31 @@ void handle_request(int client, struct sockaddr_in *addr) {
     // URL 解码
     url_decode(path);
 
-    // 安全构建文件系统路径
+    // 安全打开路径，逐级校验
     char fullpath[2048];
-    if (build_safe_path(root_dir, path, fullpath, sizeof(fullpath)) < 0) {
-        send_header(client, 403, "Forbidden", "text/html", 0, NULL);
+    int full_fd = open_safe_path(root_dir, path, fullpath, sizeof(fullpath));
+    if (full_fd < 0) {
+        if (errno == ENOENT) {
+            send_header(client, 404, "Not Found", "text/html", 0, NULL);
+        } else {
+            send_header(client, 403, "Forbidden", "text/html", 0, NULL);
+        }
         close(client);
         return;
     }
 
     struct stat st;
-    if (stat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)) {
-        list_directory(client, fullpath);
+    if (fstat(full_fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+        list_directory(client, full_fd, fullpath);
         close(client);
         return;
     }
 
     long start = 0, end = -1;
     if (parse_range(headers, &start, &end)) {
-        send_file_range(client, fullpath, start, end);
+        send_file_range(client, full_fd, fullpath, start, end);
     } else {
-        send_file_complete(client, fullpath);
+        send_file_complete(client, full_fd, fullpath);
     }
     close(client);
 }
@@ -636,15 +749,26 @@ int main(int argc, char *argv[]) {
     // 解析命令行参数
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-p") == 0 && i+1 < argc) {
-            port = atoi(argv[++i]);
+            char *end;
+            long v = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || v < 1 || v > 65535) {
+                fprintf(stderr, "端口不合法\n");
+                return 1;
+            }
+            port = (int)v;
         } else if (strcmp(argv[i], "-r") == 0 && i+1 < argc) {
             root_dir = argv[++i];
         } else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) {
             if (strcmp(argv[++i], "info") == 0) log_level = 0;
         } else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) {
-            num_threads = atoi(argv[++i]);
-            if (num_threads < 1) num_threads = 1;
-            if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+            char *end;
+            long v = strtol(argv[++i], &end, 10);
+            if (*end != '\0' || v < 1) {
+                fprintf(stderr, "线程数不合法\n");
+                return 1;
+            }
+            if (v > MAX_THREADS) v = MAX_THREADS;
+            num_threads = (int)v;
         } else if (strcasecmp(argv[i], "-pass") == 0) {
             force_set = 1;
         } else {
